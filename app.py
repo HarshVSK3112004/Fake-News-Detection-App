@@ -24,16 +24,108 @@ model      = joblib.load(model_path)
 vectorizer = joblib.load(vectorizer_path)
 st.success("Model & Vectorizer loaded successfully!")
 
+# ── Auto-detect label mapping from model.classes_ ────────────────────────────
+# Handles both (0=Real,1=Fake) and (0=Fake,1=Real) encodings automatically.
+def get_label_map():
+    """
+    Returns a dict mapping integer class values to 'Real' or 'Fake'.
+    Tries to detect from model.classes_ names; falls back to 1=Fake, 0=Real.
+    """
+    if not hasattr(model, "classes_"):
+        return {0: "Real", 1: "Fake"}
+
+    classes = list(model.classes_)
+
+    # If classes are strings like 'FAKE', 'REAL', 'fake', 'real', etc.
+    str_classes = [str(c).strip().lower() for c in classes]
+
+    label_map = {}
+    for idx, cls_str in enumerate(str_classes):
+        if cls_str in ("fake", "1", "true"):          # 'true' = "true news" sometimes reversed
+            label_map[classes[idx]] = "Fake"
+        elif cls_str in ("real", "0", "false"):
+            label_map[classes[idx]] = "Real"
+        else:
+            # Unknown string labels — use positional assumption: last class = Fake
+            label_map[classes[idx]] = "Fake" if idx == len(classes) - 1 else "Real"
+
+    return label_map
+
+LABEL_MAP = get_label_map()
+
+# Show debug info in sidebar
+with st.sidebar:
+    st.markdown("## 🔧 Model Info")
+    if hasattr(model, "classes_"):
+        st.write("**Model classes_:**", list(model.classes_))
+    st.write("**Label mapping used:**", LABEL_MAP)
+    st.caption("If predictions seem inverted, check that label mapping matches your training data.")
+
+    st.markdown("---")
+    st.markdown("### 🩺 Quick Sanity Check")
+    if st.button("Run sanity check"):
+        test_texts = [
+            "Scientists confirm vaccines are safe and effective based on clinical trials.",
+            "SHOCKING: Government puts microchips in water to control your mind!!!"
+        ]
+        for t in test_texts:
+            v = vectorizer.transform([t])
+            p = model.predict(v)[0]
+            mapped = LABEL_MAP.get(p, f"Unknown({p})")
+            nnz = v.nnz
+            st.write(f"**Text:** _{t[:60]}..._")
+            st.write(f"→ Raw pred: `{p}` → **{mapped}** | Non-zero features: `{nnz}`")
+            st.markdown("---")
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def predict_single(text: str):
-    """Return (prediction_int, prob_real, prob_fake)."""
+    """
+    Return (label_str, prob_real, prob_fake).
+    Handles label inversion safely using LABEL_MAP.
+    """
     vec  = vectorizer.transform([text])
     pred = model.predict(vec)[0]
+    label = LABEL_MAP.get(pred, "Unknown")
+
     if hasattr(model, "predict_proba"):
-        prob = model.predict_proba(vec)[0]   # [P(real), P(fake)]
-        return int(pred), float(prob[0]), float(prob[1])
-    return int(pred), None, None
+        prob = model.predict_proba(vec)[0]   # aligned with model.classes_
+
+        # Find which index corresponds to Real / Fake
+        classes = list(model.classes_)
+        prob_dict = {LABEL_MAP.get(c, str(c)): float(prob[i]) for i, c in enumerate(classes)}
+        p_real = prob_dict.get("Real", 0.0)
+        p_fake = prob_dict.get("Fake", 0.0)
+
+        return label, p_real, p_fake
+
+    return label, None, None
+
+
+def predict_batch(texts):
+    """
+    Returns (labels_list, probs_array_or_None).
+    probs_array columns are aligned to [P(Real), P(Fake)].
+    """
+    vecs  = vectorizer.transform(texts)
+    preds = model.predict(vecs)
+    labels = [LABEL_MAP.get(p, "Unknown") for p in preds]
+
+    if hasattr(model, "predict_proba"):
+        raw_probs = model.predict_proba(vecs)   # shape (n, n_classes)
+        classes   = list(model.classes_)
+
+        # Build aligned prob columns
+        real_idx = next((i for i, c in enumerate(classes) if LABEL_MAP.get(c) == "Real"), None)
+        fake_idx = next((i for i, c in enumerate(classes) if LABEL_MAP.get(c) == "Fake"), None)
+
+        p_real = raw_probs[:, real_idx] if real_idx is not None else 1 - raw_probs[:, 0]
+        p_fake = raw_probs[:, fake_idx] if fake_idx is not None else raw_probs[:, 0]
+
+        return labels, p_real, p_fake
+
+    return labels, None, None
 
 
 def prob_bar_chart(prob_real: float, prob_fake: float):
@@ -175,7 +267,16 @@ with tab1:
         if not text_input.strip():
             st.warning("Please enter some text.")
         else:
-            pred, p_real, p_fake = predict_single(text_input)
+            # ── Vectorizer sanity check ────────────────────────────────────
+            vec_check = vectorizer.transform([text_input])
+            if vec_check.nnz == 0:
+                st.warning(
+                    "⚠️ The vectorizer produced an all-zero vector for this text. "
+                    "The vocabulary may not match your input language or preprocessing. "
+                    "Prediction may be unreliable."
+                )
+
+            label, p_real, p_fake = predict_single(text_input)
 
             # ── Title / Author extraction ──────────────────────────────────
             title, author = extract_title_author(text_input)
@@ -186,7 +287,7 @@ with tab1:
             st.markdown("---")
 
             # ── Verdict ────────────────────────────────────────────────────
-            if pred == 1:
+            if label == "Fake":
                 st.error("🚨 Fake News Detected")
             else:
                 st.success("✅ Real News Detected")
@@ -238,13 +339,11 @@ with tab2:
         if st.button("▶ Run Predictions on Dataset", key="batch_predict"):
             with st.spinner("Running predictions…"):
                 texts  = df[text_col].fillna("").astype(str).tolist()
-                vecs   = vectorizer.transform(texts)
-                preds  = model.predict(vecs)
+                labels, p_real_arr, p_fake_arr = predict_batch(texts)
 
                 result_df = df.copy()
-                result_df["Predicted"]      = ["Fake" if p == 1 else "Real" for p in preds]
-                result_df["Predicted_Code"] = preds
-                result_df["text_snippet"]   = df[text_col].fillna("").astype(str).str[:80]
+                result_df["Predicted"]    = labels
+                result_df["text_snippet"] = df[text_col].fillna("").astype(str).str[:80]
 
                 # Title / Author extraction per row
                 extracted = df[text_col].fillna("").astype(str).apply(
@@ -253,17 +352,17 @@ with tab2:
                 )
                 result_df = pd.concat([result_df, extracted], axis=1)
 
-                has_proba = hasattr(model, "predict_proba")
+                has_proba = p_real_arr is not None
                 if has_proba:
-                    probs = model.predict_proba(vecs)
-                    result_df["Prob_Real (%)"] = (probs[:, 0] * 100).round(2)
-                    result_df["Prob_Fake (%)"] = (probs[:, 1] * 100).round(2)
-                    result_df["Confidence (%)"] = (probs.max(axis=1) * 100).round(2)
+                    result_df["Prob_Real (%)"]  = (p_real_arr * 100).round(2)
+                    result_df["Prob_Fake (%)"]  = (p_fake_arr * 100).round(2)
+                    import numpy as np
+                    result_df["Confidence (%)"] = (np.maximum(p_real_arr, p_fake_arr) * 100).round(2)
 
             # ── Summary metrics ────────────────────────────────────────────
-            n_fake = int((preds == 1).sum())
-            n_real = int((preds == 0).sum())
-            total  = len(preds)
+            n_fake = int((result_df["Predicted"] == "Fake").sum())
+            n_real = int((result_df["Predicted"] == "Real").sum())
+            total  = len(result_df)
 
             m1, m2, m3 = st.columns(3)
             m1.metric("Total Articles", f"{total:,}")
@@ -303,26 +402,45 @@ with tab2:
             if label_col != "(none)":
                 try:
                     from sklearn.metrics import classification_report, confusion_matrix
-                    true_labels = df[label_col].astype(int)
-                    accuracy    = (true_labels.values == preds).mean() * 100
-                    report      = classification_report(
-                        true_labels, preds,
-                        target_names=["Real", "Fake"], output_dict=True
+
+                    true_labels_raw = df[label_col].astype(str).str.strip().str.lower()
+
+                    # Normalize true labels to "Real"/"Fake" strings
+                    def normalize_true_label(v):
+                        if v in ("1", "fake", "true"):
+                            return "Fake"
+                        elif v in ("0", "real", "false"):
+                            return "Real"
+                        return v  # pass through unknown
+
+                    true_labels_str = true_labels_raw.apply(normalize_true_label)
+
+                    pred_labels = result_df["Predicted"]
+                    accuracy    = (true_labels_str.values == pred_labels.values).mean() * 100
+
+                    report = classification_report(
+                        true_labels_str, pred_labels,
+                        labels=["Real", "Fake"],
+                        target_names=["Real", "Fake"],
+                        output_dict=True,
+                        zero_division=0,
                     )
-                    cm = confusion_matrix(true_labels, preds)
+                    cm = confusion_matrix(true_labels_str, pred_labels, labels=["Real", "Fake"])
 
                     st.markdown("---")
                     st.subheader("📈 Evaluation Metrics")
-                    a1, a2, a3 = st.columns(3)
+                    a1, a2, a3, a4 = st.columns(4)
                     a1.metric("Accuracy",          f"{accuracy:.2f}%")
                     a2.metric("Precision (Fake)",  f"{report['Fake']['precision']*100:.2f}%")
                     a3.metric("Recall (Fake)",      f"{report['Fake']['recall']*100:.2f}%")
+                    a4.metric("F1 (Fake)",          f"{report['Fake']['f1-score']*100:.2f}%")
 
                     cm_df = pd.DataFrame(cm,
                         index=["Actual Real", "Actual Fake"],
                         columns=["Pred Real", "Pred Fake"])
                     st.markdown("**Confusion Matrix**")
                     st.dataframe(cm_df, use_container_width=False)
+
                 except Exception as e:
                     st.warning(f"Could not compute accuracy: {e}")
 
@@ -334,9 +452,9 @@ with tab2:
                                      horizontal=True, key="filter_radio")
             preview_df = result_df.copy()
             if filter_option == "Fake only":
-                preview_df = preview_df[preview_df["Predicted_Code"] == 1]
+                preview_df = preview_df[preview_df["Predicted"] == "Fake"]
             elif filter_option == "Real only":
-                preview_df = preview_df[preview_df["Predicted_Code"] == 0]
+                preview_df = preview_df[preview_df["Predicted"] == "Real"]
 
             display_cols = [text_col, "Extracted_Title", "Extracted_Author", "Predicted"]
             if has_proba:
@@ -353,8 +471,7 @@ with tab2:
             st.markdown("---")
             st.subheader("⬇ Download Results")
 
-            export_df = result_df.drop(columns=["Predicted_Code", "text_snippet"],
-                                       errors="ignore")
+            export_df = result_df.drop(columns=["text_snippet"], errors="ignore")
 
             # CSV
             csv_buf = io.StringIO()
@@ -372,10 +489,10 @@ with tab2:
 
             # PDF / text report
             summary = {
-                "Total articles":    total,
-                "Predicted Fake":    f"{n_fake} ({n_fake/total*100:.1f}%)",
-                "Predicted Real":    f"{n_real} ({n_real/total*100:.1f}%)",
-                "Generated":         datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "Total articles":  total,
+                "Predicted Fake":  f"{n_fake} ({n_fake/total*100:.1f}%)",
+                "Predicted Real":  f"{n_real} ({n_real/total*100:.1f}%)",
+                "Generated":       datetime.now().strftime("%Y-%m-%d %H:%M"),
             }
             if label_col != "(none)":
                 try:
@@ -385,7 +502,6 @@ with tab2:
 
             report_bytes = build_pdf_report(result_df, summary)
 
-            # Detect whether fpdf2 is available to set correct extension/mime
             try:
                 from fpdf import FPDF
                 report_name = "prediction_report.pdf"
