@@ -31,15 +31,29 @@ st.success("Model & Vectorizer loaded successfully!")
 # Input
 text = st.text_area("Enter News Text")
 
-# Predict
 if st.button("Predict"):
     if not text.strip():
         st.warning("Please enter some text")
     else:
+        # Convert text to vector
         text_vec = vectorizer.transform([text])
+
+        # Prediction
         prediction = model.predict(text_vec)[0]
 
+        # Probability (confidence)
+        if hasattr(model, "predict_proba"):
+            prob = model.predict_proba(text_vec)[0]
+            confidence = max(prob) * 100
+        else:
+            confidence = None
+
+        # Output
         if prediction == 1:
             st.error("🚨 Fake News Detected")
         else:
             st.success("✅ Real News Detected")
+
+        # Show confidence
+        if confidence is not None:
+            st.info(f"Confidence Score: {confidence:.2f}%")
