@@ -1,52 +1,69 @@
-import pandas as pd
+import os
 import re
+import pandas as pd
 import joblib
-
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 
+# ── Load data ─────────────────────────────────────────────────────────────────
 fake = pd.read_csv("dataset/Fake.csv")
 true = pd.read_csv("dataset/True.csv")
 
-fake["label"] = 0
-true["label"] = 1
+fake["label"] = 1   # 1 = Fake  ← FIXED (was 0)
+true["label"] = 0   # 0 = Real  ← FIXED (was 1)
 
-data = pd.concat([fake, true])
+data = pd.concat([fake, true], ignore_index=True)
 
-def clean_text(text):
+# Drop leaky/irrelevant columns
+data = data.drop(columns=["subject", "date"], errors="ignore")
+
+# ── Clean text ────────────────────────────────────────────────────────────────
+def clean_text(text: str) -> str:
     text = str(text).lower()
-    text = re.sub(r'http\\S+', '', text)
+    text = re.sub(r'https?://\S+', '', text)   # ← FIXED regex
     text = re.sub(r'[^a-zA-Z ]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-data["text"] = data["text"].apply(clean_text)
+# Combine title + text for richer features
+data["combined"] = (
+    data["title"].fillna("") + " " + data["text"].fillna("")
+)
+data["combined"] = data["combined"].apply(clean_text)
 
-X = data["text"]
+X = data["combined"]
 y = data["label"]
 
-vectorizer = TfidfVectorizer(max_features=5000)
-
-X = vectorizer.fit_transform(X)
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y,
-    test_size=0.2,
-    random_state=42
+# ── Vectorize ─────────────────────────────────────────────────────────────────
+vectorizer = TfidfVectorizer(
+    max_features=50000,
+    ngram_range=(1, 2),
+    sublinear_tf=True,
+    min_df=2,
+    strip_accents="unicode",
 )
 
-model = LogisticRegression()
+X_vec = vectorizer.fit_transform(X)
 
+# ── Split ─────────────────────────────────────────────────────────────────────
+X_train, X_test, y_train, y_test = train_test_split(
+    X_vec, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# ── Train ─────────────────────────────────────────────────────────────────────
+model = LogisticRegression(max_iter=1000, C=5.0, solver="lbfgs", n_jobs=-1)
 model.fit(X_train, y_train)
 
-prediction = model.predict(X_test)
+# ── Evaluate ──────────────────────────────────────────────────────────────────
+preds = model.predict(X_test)
+print(f"Accuracy: {accuracy_score(y_test, preds)*100:.2f}%")
+print(classification_report(y_test, preds, target_names=["Real", "Fake"]))
+print("Confusion Matrix:\n", confusion_matrix(y_test, preds))
 
-accuracy = accuracy_score(y_test, prediction)
-
-print("Accuracy:", accuracy)
-
-joblib.dump(model, "models/model.pkl")
+# ── Save ──────────────────────────────────────────────────────────────────────
+os.makedirs("models", exist_ok=True)
+joblib.dump(model,      "models/model.pkl")
 joblib.dump(vectorizer, "models/vectorizer.pkl")
-
-print("Model Saved Successfully")
+print("Model & Vectorizer saved successfully.")
